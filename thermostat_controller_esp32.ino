@@ -1,3 +1,6 @@
+// adapted from https://aws.amazon.com/blogs/compute/building-an-aws-iot-core-device-using-aws-serverless-and-an-esp32/
+
+// imports
 #include "secrets.h"
 #include <WiFiClientSecure.h>
 #include <MQTTClient.h>
@@ -8,33 +11,36 @@
 // pins
 #define DHTTYPE DHT22
 #define DHT_PIN 32
-#define S1 15
-#define S2 17
+#define S1 17
+#define S2 15
 #define LED 21
 
-// Topics to publish to
+#define THINGNAME "thermostat_controller_esp32"
+
+// topics to publish to
 #define GET_TOPIC "$aws/things/thermostat_controller_esp32/shadow/get"
 #define UPDATE_TOPIC "$aws/things/thermostat_controller_esp32/shadow/update"
 
-// Topics to subscribe to
+// topics to subscribe to
 #define GET_ACCEPTED_TOPIC    "$aws/things/thermostat_controller_esp32/shadow/get/accepted"
 #define GET_REJECTED_TOPIC    "$aws/things/thermostat_controller_esp32/shadow/get/rejected"
 #define UPDATE_DELTA_TOPIC    "$aws/things/thermostat_controller_esp32/shadow/update/delta"
 #define UPDATE_ACCEPTED_TOPIC "$aws/things/thermostat_controller_esp32/shadow/update/accepted"
 #define UPDATE_REJECTED_TOPIC "$aws/things/thermostat_controller_esp32/shadow/update/rejected"
-#define UPDATE_DOCUMENTS      "$aws/things/thermostat_controller_esp32/shadow/update/documents"
 
+// variables
 unsigned long currentMillis;
 unsigned long logStartMillis;
 unsigned long publishStartMillis;
-const unsigned long logPeriod = 5000;
-const unsigned long publishPeriod = 60000;
-
-long temp = 72;
+const unsigned long logPeriod = 60000 * 15; // 1 hour
+const unsigned long publishPeriod = 60000 * 15; // 1 hour
+long thermostat_temp;
 float measured_temp;
 
+// initialize sensor
 DHT dht(DHT_PIN, DHTTYPE);
 
+// initialize WiFi client and MQTT client
 WiFiClientSecure net = WiFiClientSecure();
 MQTTClient client = MQTTClient(1024);
 
@@ -43,32 +49,43 @@ void setup() {
   pinMode (S1, OUTPUT);
   pinMode (S2, OUTPUT);
   pinMode (LED, OUTPUT);
+
   // start DHT sensor
   dht.begin();
-  Serial.begin(9600);
-  // connect to Wifi and AWS
+  
+  // connect to WiFi and AWS
   digitalWrite(LED, HIGH);
   connectAWS();
   digitalWrite(LED, LOW);
+
   // record current time
   logStartMillis = millis();
   publishStartMillis = millis();
+
+  // start serial
+  Serial.begin(9600);
 }
 
 void loop() {
   currentMillis = millis();
+  // if logPeriod has elapsed, log the temperature
+  // this just Serial prints the temperture, but could log to SSD
   if(currentMillis - logStartMillis > logPeriod) {
     measured_temp = dht.readTemperature(true);
     Serial.print("\nCurrent temperature: ");
-    Serial.println(temp);
+    Serial.println(thermostat_temp);
     Serial.print("\nMeasured temperature: ");
     Serial.println(measured_temp);
     logStartMillis = currentMillis;
   }
+
+  // if logPeriod has elapsed, publish the measured temperature
   if(currentMillis - publishStartMillis > publishPeriod) {
+    measured_temp = dht.readTemperature(true);
     publishUpdateState();
     publishStartMillis = currentMillis;
   }
+
   // listen for MQTT messages
   client.loop();
   Serial.print(".");
@@ -76,6 +93,7 @@ void loop() {
 }
 
 void connectAWS() {
+  // connect to WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -86,15 +104,15 @@ void connectAWS() {
     Serial.print(".");
   }
 
-  // Configure WiFiClientSecure to use the AWS IoT device credentials
+  // configure WiFiClientSecure to use the AWS IoT device credentials
   net.setCACert(AWS_CERT_CA);
   net.setCertificate(AWS_CERT_CRT);
   net.setPrivateKey(AWS_CERT_PRIVATE);
 
-  // Connect to the MQTT broker on the AWS endpoint we defined earlier
+  // connect to the MQTT broker on the AWS endpoint we defined earlier
   client.begin(AWS_IOT_ENDPOINT, 8883, net);
 
-  // Create a message handler
+  // create a message handler
   client.onMessage(messageHandler);
 
   Serial.print("Connecting to AWS IOT");
@@ -109,7 +127,7 @@ void connectAWS() {
     return;
   }
 
-  // Subscribe to a topic
+  // subscribe to topics
   client.subscribe(UPDATE_ACCEPTED_TOPIC);
   client.subscribe(UPDATE_REJECTED_TOPIC);
   client.subscribe(UPDATE_DELTA_TOPIC);
@@ -123,16 +141,20 @@ void connectAWS() {
 }
 
 void publishUpdateState() {
+  // create JSON document
   StaticJsonDocument<200> doc;
-  doc["state"]["reported"]["thermostat_temperature"] = temp;
-  Serial.println(measured_temp);
-  // if measured_temp is NaN due to sensor issue, ESP32 will set this value to null 
-  // and measured_temp will be removed from the shadow document  
+  doc["state"]["reported"]["thermostat_temperature"] = thermostat_temp;
+  /* 
+   * if measured_temp is NaN due to sensor issue, the ESP32 will set this value
+   * to null and measured_temp will be removed from the shadow document 
+  */
   doc["state"]["reported"]["measured_temperature"] = measured_temp;
+  // serialize JSON
   char jsonBuffer[512];
   serializeJson(doc, jsonBuffer);
   Serial.print("publishing to: ");
   Serial.println(UPDATE_TOPIC);
+  // publish update with JSON payload!
   client.publish(UPDATE_TOPIC, jsonBuffer);
 }
 
@@ -143,6 +165,7 @@ void publishGetState() {
 }
 
 void messageHandler(String &topic, String &payload) {
+  // deserialize JSON document
   StaticJsonDocument<1024> doc;
   DeserializationError error = deserializeJson(doc, payload);
   if (error) {
@@ -153,13 +176,15 @@ void messageHandler(String &topic, String &payload) {
 
   Serial.println("incoming: " + topic + " - " + payload);
 
+  // if message is GET_ACCEPTED_TOPIC, save the thermostat_temperature and publish update state
   if(strcmp (GET_ACCEPTED_TOPIC, topic.c_str()) == 0) {
-    temp = doc["state"]["desired"]["thermostat_temperature"];
+    thermostat_temp = doc["state"]["desired"]["thermostat_temperature"];
     Serial.print("Updating temperature to: "); 
-    Serial.println(temp);
+    Serial.println(thermostat_temp);
     publishUpdateState();
   }
 
+  // if message is UPDATE_DELTA_TOPIC, change the temperature
   if(strcmp (UPDATE_DELTA_TOPIC, topic.c_str()) == 0) {
     changeTemperature(doc["state"]["thermostat_temperature"]);
   }
@@ -167,27 +192,28 @@ void messageHandler(String &topic, String &payload) {
 }
 
 void changeTemperature(int desired_temp) {
-  if (desired_temp < temp) {
+  if (desired_temp < thermostat_temp) {
       Serial.println("actuating S1");
       digitalWrite(S1, HIGH);
-      delay(1500);
+      delay(1200);
       digitalWrite(S1, LOW);
       delay(500);
-    while (desired_temp < temp) {
+    while (desired_temp < thermostat_temp) {
         actuateSolenoid(S1);
-        temp -= 1;
+        thermostat_temp -= 1;
     }
   } else {
       Serial.println("actuating S2");
       digitalWrite(S2, HIGH);
-      delay(2000);
+      delay(1200);
       digitalWrite(S2, LOW);
       delay(500);
-    while (desired_temp > temp) {
+    while (desired_temp > thermostat_temp) {
         actuateSolenoid(S2);
-        temp += 1;
+        thermostat_temp += 1;
     }
   }
+  // after temperature change, publish updated state
   publishUpdateState();
 }
 
