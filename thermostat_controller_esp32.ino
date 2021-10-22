@@ -32,8 +32,8 @@
 unsigned long currentMillis;
 unsigned long logStartMillis;
 unsigned long publishStartMillis;
-const unsigned long logPeriod = 60000 * 15; // 1 hour
-const unsigned long publishPeriod = 60000 * 15; // 1 hour
+const unsigned long logPeriod = 60000 * 15; // 15 minutes
+const unsigned long publishPeriod = 60000 * 15; // 15 minutes
 long thermostat_temp;
 float measured_temp;
 
